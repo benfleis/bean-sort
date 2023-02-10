@@ -1,0 +1,33 @@
+#!/usr/bin/env bb
+
+;; snag accounts.yaml, and grab all accounts
+;; for IBANs grab last 9 digits
+;; for others TBD
+;; with that set, grep the entire repo (git ls-files) and verify that these
+;; strings do not exist in any commit-able files.
+
+(require '[babashka.process :refer [process]])
+(require '[clj-yaml.core :as yaml])
+
+(defn process-seq
+  ([opts cmd] (apply process opts cmd))
+  ([passthrough opts cmd] (apply process passthrough opts cmd)))
+
+(def accounts-yaml (if (empty? *command-line-args*) "accounts.yaml" (first *command-line-args*)))
+(def accounts-conf (yaml/parse-string (slurp accounts-yaml)))
+(def disallowed-strings
+  (into #{}
+        (concat
+         (:account-holders accounts-conf)
+         (->> (:accounts accounts-conf) (map #(select-keys % [:name :iban :name-on-account])) (map vals) flatten)
+         (->> (map :iban (:accounts accounts-conf)) (map #(subs % 9)))))) ; grab last 9 chars of IBANS too
+(apply println "Grepping for disallowed words:\n" (mapcat list disallowed-strings (repeat "\n")))
+
+(def grep-cmd (concat ["xargs rg" "--no-follow" "-i"] (mapcat list (repeat "-e") disallowed-strings)))
+(def proc (-> (process-seq {} ["git" "ls-files"])
+              (process-seq {:out :inherit :err :inherit} grep-cmd)
+              deref))
+(case (:exit proc)
+  0 (do (println "Failed. See above.") (System/exit 1))
+  1 (do (println "Ok, no disallowed words found.") (System/exit 0))
+  (do (println "Unexpected Failure." (-> proc last)) (System/exit 2)))

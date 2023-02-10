@@ -1,0 +1,210 @@
+#!/usr/bin/env bb
+
+; (require '[clojure.string :as str])
+(require '[babashka.cli :as cli])
+(require '[babashka.fs :as fs])
+(require '[clj-yaml.core :as yaml])
+(require '[clojure.data.csv :as csv])
+(require '[clojure.java.io :as io])
+(require '[clojure.string :as str])
+(require '[taoensso.timbre :as timbre :refer [log!]])
+
+
+(def accounts-conf (yaml/parse-string (slurp "accounts.yaml")))
+(def conf-accounts (:accounts accounts-conf))
+(def cont-holders (:account-holders accounts-conf))
+(def conf-ibans (set (map :iban conf-accounts)))
+
+(defn fatal [& args]
+  (println args)
+  ; (log! :error :p args)
+  (System/exit 1))
+
+(defn fatalf [& args]
+  (println (apply format args))
+  ; (log! :error :f args)
+  (System/exit 1))
+
+(defn get-asn-iban-tail [filename] 
+  (let [match #(or (re-matches #"(?:.*_?)(NL[A-Za-z0-9]{6}\d{10})_\d{14}.csv$" %) ; asn xaction history: NL full IBAN "transactie-historie_NL27ASNB0102349876_20220405203628.csv"
+                   (re-matches #"(?:.*[^\d])?_?(\d{10})_\d{8}_\d{6}\.csv$" %))    ; asn download: ASN account num "0102349876_05042022_223159.csv"
+        acct (-> filename match second)]
+    (assert acct (str "filename did not match ASN pattern: " filename))
+    acct))
+
+(comment
+  (get-asn-iban-tail "0102349876_13042020_103736.csv") :returns "0102349876"
+  (get-asn-iban-tail "bank-0102349876_13042020_103736.csv") :returns "0102349876"
+  (get-asn-iban-tail "02349876_13042020_103736.csv") :fails "did not match"
+  (get-asn-iban-tail "transactie-historie_NL51ASNB00102349876_20220405202656.csv") :returns "0102349876")
+
+#_ (defn iban->account [accounts iban]
+  (->> accounts (drop-while #(not= (:iban %) iban)) (first)))
+
+(defn iban-tail->account [accounts iban-tail]
+  (assert (contains? #{9 10 18} (count iban-tail)) "partial iban not acceptable length (9, 10, 18)")
+  (->> accounts
+       (drop-while #(not (str/ends-with? (:iban %) iban-tail)))
+       first))
+
+(comment :test (iban-tail->account conf-accounts "") :fails "length")
+(comment :test (iban-tail->account conf-accounts "0102349876") :has :nickname "my-asn")
+
+(defn parse-date-range [date-range]
+  (let [r (->> date-range
+               (re-matches #"(\d{4}-\d{2}-\d{2})--(\d{4}-\d{2}-\d{2})")
+               rest
+               (map #(java.time.LocalDate/parse %)))]
+    (assert (= 2 (count r)) "date-range invalid: syntax")
+    (assert (not (.isBefore (second r) (first r))) "date-range invalid: start is later than end")
+    r))
+
+(comment :test (parse-date-range "") :fails)
+(comment :test (parse-date-range "123-23-34--44-44-44") :fails)
+(comment :test (parse-date-range "2022-02-02--2022-02-01") :fails)
+(comment :test (parse-date-range "2022-02-02--2022-02-02") :returns :good-stuff)
+(comment :test (parse-date-range "2022-02-02--2022-02-04") :returns :good-stuff)
+
+
+(defn normalize-asn-filename [date-range filename]
+  (let [iban-tail (get-asn-iban-tail filename)
+        account (iban-tail->account conf-accounts iban-tail)
+        {:keys [nickname iban]} account
+        dr-str (map #(.toString %) date-range)]
+    (str nickname " " iban " " (first dr-str) "--" (second dr-str) ".csv")))
+
+; ASN CSV spec: https://www.asnbank.nl/web/file?uuid=fc28db9c-d91e-4a2c-bd3a-30cffb057e8b&owner=6916ad14-918d-4ea8-80ac-f71f0ff1928e&contentid=852
+(def asn-field-names [
+  "Boekingsdatum",
+  "Opdrachtgeversrekening",
+  "Tegenrekeningnummer",
+  "Naam tegenrekening",
+  "_Adres",
+  "_Postcode",
+  "_Plaats",
+  "Valutasoort rekening",
+  "Saldo rekening voor mutatie",
+  "Valutasoort mutatie",
+  "Transactiebedrag",
+  "Journaaldatum",
+  "Valutadatum",
+  "Interne transactiecode",
+  "Globale transactiecode",
+  "Volgnummer transactie",
+  "Betalingskenmerk",
+  "Omschrijving",
+  "Afschriftnummer",
+])
+
+(def asn-field-map (into {} (map vector asn-field-names (range))))
+
+(defn get-asn-field-by-name [field-name row]
+  (-> field-name (asn-field-map) (row)))
+
+(comment :test (get-asn-field-by-name "Boekingsdatum" ["30-01-2001" #_ "skip unused fields"]) :returns :thing)
+
+(def reverse-iso-date-formatter (java.time.format.DateTimeFormatter/ofPattern "dd-MM-yyyy"))
+
+(defn get-asn-booking-date [row]
+  (as-> row $
+    (get-asn-field-by-name "Boekingsdatum" $)
+    (java.time.LocalDate/parse $ reverse-iso-date-formatter)))
+
+(comment :test (get-asn-booking-date ["30-01-2001" #_ "skip unused fields"]) :returns :thing)
+
+(defn -require [condition msg-or-fn]
+  (if (not condition) (fatal (if (string? msg-or-fn) msg-or-fn (msg-or-fn))) nil))
+
+;; validate ASN CSV data against known accounts, given date range
+;; once complete return summary {:date-range [$first, $last], :ibans [...], :line-item-count N}
+;; in order to validate non-conflicting write
+(defn validate-asn-data [date-range line-items]
+  (let [dates         (map get-asn-booking-date line-items)
+        too-early?    #(.isBefore % (first date-range))
+        too-late?     #(.isAfter % (second date-range))
+        err-dates     (filter #(or (too-early? %) (too-late? %)) dates)
+        line-ibans    (distinct (map (partial get-asn-field-by-name "Opdrachtgeversrekening") line-items))
+        err-ibans     (filter #(not (contains? conf-ibans %)) line-ibans)
+        ok-col-count? #(= (count asn-field-names) (count %))
+        err-cols      (filter #(not (ok-col-count? %)) line-items)]
+    (-require (empty? err-dates) #(format "line-items contains out of bounds dates: %s" (vec err-dates)))
+    (-require (empty? err-ibans) #(format "line-items contains unknown ibans: %s" (vec err-ibans)))
+    (-require (empty? err-cols) #(format "line-items contains rows with incorrect column count: n=%d/%d" (count err-cols) (count line-items)))
+    ; now we've validated input file, return
+    {:date-range [(first dates) (last dates)]
+     :ibans line-ibans
+     :line-item-count (count line-items)}))
+
+(comment :test (validate-asn-data 
+                (parse-date-range "2022-01-01--2022-12-31")
+                []) :returns :stuff :line-item-count 0)
+
+(comment :test (validate-asn-data 
+                (parse-date-range "2022-01-01--2022-12-31")
+                [["asdf"]]) :fails)
+
+(comment :test (validate-asn-data 
+                (parse-date-range "2022-01-01--2022-12-31")
+                [["31-12-2021"]]) :fails)
+
+(comment :test (validate-asn-data 
+                (parse-date-range "2022-01-01--2022-12-31")
+                [["31-12-2022" nil "NL00ASNB0011223344"]]) :returns :stuff :line-item-count 1)
+
+;; read ASN CSV file first with ';' as sep, and try ',' if it fails to turn up some rows
+(defn read-asn-csv [filename]
+  (let [read-with (fn [sep]
+                    (with-open [reader (io/reader filename)]
+                      (doall (csv/read-csv reader :separator sep))))
+        with-semis (read-with \;)]
+    (if (> (-> with-semis first count) 1) ; use rows[0].count > 1 as test, since it should have 10+ cols
+        with-semis 
+        (read-with \,))))
+
+(comment :test
+         (doseq [f ["../asn/2017/0102349876_29102017_145808.csv"
+                    "../asn/2017/0102349876_29102017_150354.csv"
+                    "../asn/2017/0102349876_29102018_203359.csv"
+                    "../asn/2017/0990066778_29102018_205835.csv"]]
+           (->> f read-asn-csv (validate-asn-data (parse-date-range "2000-01-01--2037-12-31")) (count))))
+
+
+(defn copy-asn-file [{{:keys [date-range filename]} :opts}]
+  (let [dst-filename (normalize-asn-filename date-range filename)
+        line-items (read-asn-csv filename)
+        data-summary (validate-asn-data date-range line-items)]
+     (println "Summary: " data-summary)
+     (println "Destination file: " (fs/path "ledgers/raw" dst-filename))
+     #_ (validate-destination dst data-summary)
+     (try
+      (fs/copy (fs/file filename) (fs/file "ledgers/raw" dst-filename) {:copy-attributes true :replace-existing false})
+      (catch java.nio.file.FileAlreadyExistsException _
+        (fatalf "Failed: destination file exists: %s Fix/remove then try again." dst-filename)))))
+
+(defn print-usage [{:keys [] :as _opts}]
+  (println (str/trim "
+usage: normalize-raw asn <date-range> <filename>
+
+- date-range specified as YYYY-MM-DD--YYYY-MM-DD (inclusive)
+- input filename (will be automatically copied & renamed if valid)
+   ")))
+
+(def commands 
+ [{:cmds ["asn"]  :fn copy-asn-file   :args->opts [:date-range :filename]}
+  {:cmds []       :fn print-usage}])
+
+#_(defn asn [filename]
+  ;; native filename is acctnum_DDMMYY_HHMMSS.csv
+  ;; where timestamp is generation time (has nothing to do with the query)
+  ;; thus ask for transation period
+  (let [acct (->> filename (re-matches #"\d{10}_\d{8}_\d{6}\.csv$") (nth 1))]
+        (assert acct (str "filename did not match ASN pattern: " filename))
+        acct
+        )
+  )
+
+(defn -main [& args]
+  (cli/dispatch commands args {:coerce {:date-range parse-date-range}}))
+
+(when (= *file* (System/getProperty "babashka.file"))
+  (apply -main *command-line-args*))
